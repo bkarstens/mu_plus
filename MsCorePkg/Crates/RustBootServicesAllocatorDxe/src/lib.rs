@@ -31,12 +31,9 @@
 #![no_std]
 #![feature(allocator_api)]
 
-use core::{
-    alloc::{GlobalAlloc, Layout},
-    ffi::c_void,
-    sync::atomic::AtomicPtr,
-};
+use core::alloc::{GlobalAlloc, Layout};
 
+use boot_services::{self, allocation::MemoryType, BootServices};
 use r_efi::efi;
 
 /// Static GLOBAL_ALLOCATOR instance that is marked with the `#[global_allocator]` attribute.
@@ -48,59 +45,45 @@ const ALLOC_TRACKER_SIG: u32 = 0x706F6F6C; //arbitrary sig
 // Used to track allocations that need larger alignment than the UEFI Pool alignment (8 bytes).
 struct AllocationTracker {
     signature: u32,
-    orig_ptr: *mut c_void,
+    orig_ptr: *mut u8,
 }
 
 /// Boot services allocator implementation. Must be initialized with a boot_services pointer before use,
 /// see [`BootServicesAllocator::init()`].
-pub struct BootServicesAllocator {
-    boot_services: AtomicPtr<efi::BootServices>,
+pub struct BootServicesAllocator<'a> {
+    boot_services: boot_services::StandardBootServices<'a>,
 }
 
-impl BootServicesAllocator {
+impl<'a> BootServicesAllocator<'a> {
     // Create a new instance. const fn to allow static initialization.
     const fn new() -> Self {
-        BootServicesAllocator { boot_services: AtomicPtr::new(core::ptr::null_mut()) }
+        BootServicesAllocator { boot_services: boot_services::StandardBootServices::new_uninit() }
     }
 
-    // implement allocation using EFI boot services AllocatePool() call.
-    fn boot_services_alloc(&self, layout: Layout, boot_services: &efi::BootServices) -> *mut u8 {
+    // Implement allocation using EFI boot services AllocatePool() call.
+    fn boot_services_alloc(&self, layout: Layout, boot_services: &boot_services::StandardBootServices<'a>) -> *mut u8 {
         match layout.align() {
-            0..=8 => {
-                //allocate the pointer directly since UEFI pool allocations are 8-byte aligned already.
-                let mut ptr: *mut c_void = core::ptr::null_mut();
-                match (boot_services.allocate_pool)(
-                    efi::BOOT_SERVICES_DATA,
-                    layout.size(),
-                    core::ptr::addr_of_mut!(ptr),
-                ) {
-                    efi::Status::SUCCESS => ptr as *mut u8,
-                    _ => core::ptr::null_mut(),
-                }
-            }
+            0..=8 => boot_services
+                .allocate_pool(MemoryType::BOOT_SERVICES_DATA, layout.size())
+                .unwrap_or(core::ptr::null_mut()),
             _ => {
-                //allocate extra space to align the allocation as requested and include a tracking structure to allow
-                //recovery of the original pointer for de-allocation. Tracking structure follows the allocation.
+                // Allocate extra space to align the allocation as requested and include a tracking structure to allow
+                // recovery of the original pointer for de-allocation. Tracking structure follows the allocation.
                 let (expanded_layout, tracking_offset) = match layout.extend(Layout::new::<AllocationTracker>()) {
-                    Ok(x) => x,
+                    Ok((layout, offset)) => (layout, offset),
                     Err(_) => return core::ptr::null_mut(),
                 };
                 let expanded_size = expanded_layout.size() + expanded_layout.align();
 
-                let mut orig_ptr: *mut c_void = core::ptr::null_mut();
-                let final_ptr = match (boot_services.allocate_pool)(
-                    efi::BOOT_SERVICES_DATA,
-                    expanded_size,
-                    core::ptr::addr_of_mut!(orig_ptr),
-                ) {
-                    efi::Status::SUCCESS => orig_ptr as *mut u8,
-                    _ => return core::ptr::null_mut(),
+                let orig_ptr = match boot_services.allocate_pool(MemoryType::BOOT_SERVICES_DATA, expanded_size) {
+                    Ok(ptr) => ptr,
+                    Err(_status) => return core::ptr::null_mut(),
                 };
 
-                //align the pointer up to the required alignment.
-                let final_ptr = unsafe { final_ptr.add(final_ptr.align_offset(expanded_layout.align())) };
+                // Align the pointer up to the required alignment.
+                let final_ptr = unsafe { orig_ptr.add(orig_ptr.align_offset(expanded_layout.align())) };
 
-                //get a reference to the allocation tracking structure after the allocation and populate it.
+                // Get a reference to the allocation tracking structure after the allocation and populate it.
                 let tracker = unsafe {
                     final_ptr
                         .add(tracking_offset)
@@ -117,57 +100,53 @@ impl BootServicesAllocator {
         }
     }
 
-    // implement dealloc (free) using EFI boot services FreePool() call.
-    fn boot_services_dealloc(&self, boot_services: &efi::BootServices, ptr: *mut u8, layout: Layout) {
+    // Implement dealloc (free) using EFI boot services FreePool() call.
+    fn boot_services_dealloc(
+        &self,
+        boot_services: &boot_services::StandardBootServices<'a>,
+        ptr: *mut u8,
+        layout: Layout,
+    ) {
         match layout.align() {
             0..=8 => {
-                //pointer was allocated directly, so free it directly.
-                let _ = (boot_services.free_pool)(ptr as *mut c_void);
+                // Pointer was allocated directly, so free it directly.
+                let _ = boot_services.free_pool(ptr);
             }
             _ => {
-                //pointer was potentially adjusted for alignment. Recover tracking structure to retrieve the original
-                //pointer to free.
-                let (_, tracking_offset) = match layout.extend(Layout::new::<AllocationTracker>()) {
-                    Ok(x) => x,
+                // Pointer was potentially adjusted for alignment. Recover tracking structure to retrieve the original
+                // Pointer to free.
+                let (_layout, tracking_offset) = match layout.extend(Layout::new::<AllocationTracker>()) {
+                    Ok((layout, offset)) => (layout, offset),
                     Err(_) => return,
                 };
                 let tracker = unsafe {
                     ptr.add(tracking_offset).cast::<AllocationTracker>().as_mut().expect("tracking pointer is invalid")
                 };
+
                 debug_assert_eq!(tracker.signature, ALLOC_TRACKER_SIG);
-                let _ = (boot_services.free_pool)(tracker.orig_ptr);
+                let _ = boot_services.free_pool(tracker.orig_ptr);
             }
         }
     }
 
-    /// initializes the allocator instance with a pointer to the UEFI Boot Services table.
-    pub fn init(&self, boot_services: *mut efi::BootServices) {
-        self.boot_services.store(boot_services, core::sync::atomic::Ordering::SeqCst);
+    /// Initializes the allocator instance with a pointer to the UEFI Boot Services table.
+    pub fn init(&self, efi_boot_services: *mut efi::BootServices) {
+        self.boot_services.initialize(unsafe { &*efi_boot_services });
     }
 }
 
-unsafe impl GlobalAlloc for BootServicesAllocator {
+unsafe impl<'a> GlobalAlloc for BootServicesAllocator<'a> {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let bs_ptr = self.boot_services.load(core::sync::atomic::Ordering::SeqCst);
-        if let Some(boot_services) = unsafe { bs_ptr.as_ref() } {
-            self.boot_services_alloc(layout, boot_services)
-        } else {
-            panic!("Attempted allocation on uninitialized allocator")
-        }
+        self.boot_services_alloc(layout, &self.boot_services)
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        let bs_ptr = self.boot_services.load(core::sync::atomic::Ordering::SeqCst);
-        if let Some(boot_services) = unsafe { bs_ptr.as_ref() } {
-            self.boot_services_dealloc(boot_services, ptr, layout)
-        } else {
-            panic!("Attempted deallocation on uninitialized allocator")
-        }
+        self.boot_services_dealloc(&self.boot_services, ptr, layout)
     }
 }
 
-unsafe impl Sync for BootServicesAllocator {}
-unsafe impl Send for BootServicesAllocator {}
+unsafe impl<'a> Sync for BootServicesAllocator<'a> {}
+unsafe impl<'a> Send for BootServicesAllocator<'a> {}
 
 #[cfg(test)]
 mod tests {
