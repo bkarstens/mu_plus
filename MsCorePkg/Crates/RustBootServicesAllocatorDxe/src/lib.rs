@@ -38,7 +38,7 @@ use r_efi::efi;
 
 /// Static GLOBAL_ALLOCATOR instance that is marked with the `#[global_allocator]` attribute.
 #[cfg_attr(not(test), global_allocator)]
-pub static GLOBAL_ALLOCATOR: BootServicesAllocator = BootServicesAllocator::new();
+pub static GLOBAL_ALLOCATOR: BootServicesAllocator<boot_services::StandardBootServices> = BootServicesAllocator::new();
 
 const ALLOC_TRACKER_SIG: u32 = 0x706F6F6C; //arbitrary sig
 
@@ -48,20 +48,23 @@ struct AllocationTracker {
     orig_ptr: *mut u8,
 }
 
-/// Boot services allocator implementation. Must be initialized with a boot_services pointer before use,
+/// Boot services allocator implementation. Must be initialized with a StandardBootServices before use,
 /// see [`BootServicesAllocator::init()`].
-pub struct BootServicesAllocator<'a> {
-    boot_services: boot_services::StandardBootServices<'a>,
+pub struct BootServicesAllocator<BS: boot_services::BootServices> {
+    boot_services: Option<BS>,
 }
 
-impl<'a> BootServicesAllocator<'a> {
+impl<BS> BootServicesAllocator<BS>
+where
+    BS: boot_services::BootServices,
+{
     // Create a new instance. const fn to allow static initialization.
     const fn new() -> Self {
-        BootServicesAllocator { boot_services: boot_services::StandardBootServices::new_uninit() }
+        BootServicesAllocator { boot_services: None }
     }
 
     // Implement allocation using EFI boot services AllocatePool() call.
-    fn boot_services_alloc(&self, layout: Layout, boot_services: &boot_services::StandardBootServices<'a>) -> *mut u8 {
+    fn boot_services_alloc(&self, layout: Layout, boot_services: &impl boot_services::BootServices) -> *mut u8 {
         match layout.align() {
             0..=8 => boot_services
                 .allocate_pool(MemoryType::BOOT_SERVICES_DATA, layout.size())
@@ -103,15 +106,13 @@ impl<'a> BootServicesAllocator<'a> {
     // Implement dealloc (free) using EFI boot services FreePool() call.
     fn boot_services_dealloc(
         &self,
-        boot_services: &boot_services::StandardBootServices<'a>,
+        boot_services: &impl boot_services::BootServices,
         ptr: *mut u8,
         layout: Layout,
     ) {
         match layout.align() {
-            0..=8 => {
-                // Pointer was allocated directly, so free it directly.
-                let _ = boot_services.free_pool(ptr);
-            }
+            // Pointer was allocated directly, so free it directly.
+            0..=8 => boot_services.free_pool(ptr).unwrap_or_default(),
             _ => {
                 // Pointer was potentially adjusted for alignment. Recover tracking structure to retrieve the original
                 // Pointer to free.
@@ -131,22 +132,26 @@ impl<'a> BootServicesAllocator<'a> {
 
     /// Initializes the allocator instance with a pointer to the UEFI Boot Services table.
     pub fn init(&self, efi_boot_services: *mut efi::BootServices) {
+        self.boot_services = BS{};
         self.boot_services.initialize(unsafe { &*efi_boot_services });
     }
 }
 
-unsafe impl<'a> GlobalAlloc for BootServicesAllocator<'a> {
+unsafe impl<BS> GlobalAlloc for BootServicesAllocator<BS>
+where
+    BS: boot_services::BootServices,
+{
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        self.boot_services_alloc(layout, &self.boot_services)
+        self.boot_services_alloc(layout, self.boot_services)
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        self.boot_services_dealloc(&self.boot_services, ptr, layout)
+        self.boot_services_dealloc(self.boot_services, ptr, layout)
     }
 }
 
-unsafe impl<'a> Sync for BootServicesAllocator<'a> {}
-unsafe impl<'a> Send for BootServicesAllocator<'a> {}
+unsafe impl<BS> Sync for BootServicesAllocator<BS> where BS: boot_services::BootServices {}
+unsafe impl<BS> Send for BootServicesAllocator<BS> where BS: boot_services::BootServices {}
 
 #[cfg(test)]
 mod tests {
@@ -211,7 +216,7 @@ mod tests {
 
     #[test]
     fn basic_alloc_and_dealloc() {
-        static ALLOCATOR: BootServicesAllocator = BootServicesAllocator::new();
+        static ALLOCATOR: BootServicesAllocator<boot_services::StandardBootServices> = BootServicesAllocator::new();
         ALLOCATOR.init(&mut mock_boot_services());
 
         let layout = Layout::from_size_align(0x40, 0x8).unwrap();
@@ -225,7 +230,7 @@ mod tests {
 
     #[test]
     fn big_alignment_should_allocate_tracking_structure() {
-        static ALLOCATOR: BootServicesAllocator = BootServicesAllocator::new();
+        static ALLOCATOR: BootServicesAllocator<boot_services::StandardBootServices> = BootServicesAllocator::new();
         ALLOCATOR.init(&mut mock_boot_services());
 
         let layout = Layout::from_size_align(0x40, 0x1000).unwrap();
